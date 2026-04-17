@@ -151,6 +151,7 @@ class ChatServer:
 
                         msg = MessageData(uid, peer_id, MessageType.HISTORY_REQUEST, json.dumps(messages))
                         await self.user_to_websockets[uid].send(msg.to_json())
+                        print(f"History of user {uid}, {peer_id} sent to user {uid}")
 
 
                     case _:

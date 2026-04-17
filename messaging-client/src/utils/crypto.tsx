@@ -3,14 +3,15 @@ import { openDB } from 'idb';
 const DB_NAME = 'UserKeyStore';
 const STORE_NAME = 'keys';
 
-export async function getPersistentKeyPair(): Promise<CryptoKeyPair> {
+export async function getPersistentKeyPair(userId: string): Promise<CryptoKeyPair> {
   const db = await openDB(DB_NAME, 1, {
     upgrade(db) {
       db.createObjectStore(STORE_NAME);
     },
   });
 
-  const savedKeys = await db.get(STORE_NAME, 'user-auth-key');
+  const userStoreKey = `user-auth-key-${userId}`;
+  const savedKeys = await db.get(STORE_NAME, userStoreKey);
   if (savedKeys) return savedKeys;
 
   const keyPair = await window.crypto.subtle.generateKey(
@@ -19,7 +20,7 @@ export async function getPersistentKeyPair(): Promise<CryptoKeyPair> {
     ["deriveKey"]
   );
 
-  await db.put(STORE_NAME, keyPair, 'user-auth-key');
+  await db.put(STORE_NAME, keyPair, userStoreKey);
   return keyPair;
 }
 

@@ -15,6 +15,7 @@ function App() {
   const [chatStarted, setChatStarted] = useState<boolean>(false);
   const [userId, setUserId] = useState<string>('');
   const [recipientId, setRecipientId] = useState<string>('');
+  const recipientIdRef = useRef<string>('');
 
   const [myKeys, setMyKeys] = useState<CryptoKeyPair | null>(null);
   const myKeysRef = useRef<CryptoKeyPair | null>(null);
@@ -34,7 +35,11 @@ function App() {
     const { ciphertext, iv } = JSON.parse(message.content);
     const decryptedText = await decryptData(ciphertext, iv, secret);
     const decryptedMsg = {...message, content: decryptedText};
-    setMessages((prev) => [...prev, decryptedMsg]);
+    
+    const currentPeer = parseInt(recipientIdRef.current);
+    if (message.sender_id === currentPeer || (message.recipient_id === currentPeer && message.sender_id === parseInt(userId))) {
+      setMessages((prev) => [...prev, decryptedMsg]);
+    }
   }
 
   const processReceivedBatch = (waitingMessages: ChatMessage[], secret: CryptoKey) => {
@@ -56,13 +61,18 @@ function App() {
   }, [pendingMessages])
 
   useEffect(() => {
+    recipientIdRef.current = recipientId;
+  }, [recipientId]);
+
+  useEffect(() => {
     if (!isLoggedIn) return;
+    console.log(`Log-in detected. Origin: ${window.location.origin}, User: ${userId}`);
     socket.current = new WebSocket('ws://localhost:8765');
 
     socket.current.onopen = async () => {
       console.log(`Connected as User ${userId}`);
       
-      const keys = await getPersistentKeyPair();
+      const keys = await getPersistentKeyPair(userId);
       setMyKeys(keys);
 
       if (keys && keys.publicKey) {
@@ -100,7 +110,7 @@ function App() {
 
           const messagesToProcess = pendingMessagesRef.current[theirId] || []
           if (messagesToProcess.length > 0) {
-            console.log(`Processing ${messagesToProcess.length} pending messages for ${theirId}`);
+            console.log(`Processing ${messagesToProcess.length} pending messages for conversation with user ${theirId}`);
             processReceivedBatch(messagesToProcess, derivedSecret);
           }
 
@@ -122,13 +132,17 @@ function App() {
           }))
         }
         else {
-          processReceivedMsg(data, sharedSecret);
+          try {
+            await processReceivedMsg(data, sharedSecret);
+          } catch (e) {
+            console.error("Failed to process message:", e);
+          }
         }
       } else if (data.message_type == "HISTORY_REQUEST") {
         const historyArray = JSON.parse(data.content) as ChatMessage[];
         const peerId = data.recipient_id
         const sharedSecret = secretRingRef.current[peerId]
-        console.log(`User ${data.sender_id} received chat history with user ${peerId}`)
+        console.log(`User ${data.sender_id} received chat history with user ${peerId}. History length: ${historyArray.length}`)
         if (!sharedSecret) {
           console.log("Shared secret not availble yet, putting into pending messages for now")
           setPendingMessages(prev => ({
@@ -136,7 +150,7 @@ function App() {
             [peerId]: [...historyArray, ...(prev[peerId] || [])]
           }))
         } else {
-          console.log("Shared secret detected! Processing")
+          console.log(`Shared secret detected for user ${data.sender_id} and ${peerId}! Processing`)
           processReceivedBatch(historyArray, sharedSecret);
         }
       }
@@ -151,8 +165,9 @@ function App() {
   }, [isLoggedIn]);
 
   useEffect(() => {
+    if (!chatStarted) return;
     if (socket.current?.readyState === WebSocket.OPEN && isLoggedIn && recipientId && myKeys) {
-      console.log("Recipient number: ", recipientId)
+      console.log("Recipient number:", recipientId)
       const uid = parseInt(userId);
       const targetId = parseInt(recipientId);
       const sharedSecret = secretRingRef.current[targetId];
@@ -204,6 +219,35 @@ function App() {
     }
   };
 
+  
+  function logout() {
+    setIsLoggedIn(false);
+    setChatStarted(false);
+    setUserId('');
+    setRecipientId('');
+    recipientIdRef.current = '';
+    setMyKeys(null);
+    myKeysRef.current = null;
+    setSecretRing({});
+    secretRingRef.current = {};
+    setMessages([]);
+    setPendingMessages({});
+    pendingMessagesRef.current = {};
+    setInput('');
+    socket.current?.close();
+    socket.current = null;
+  }
+
+  function leaveChat() {
+    setChatStarted(false);
+    setRecipientId('');
+    recipientIdRef.current = '';
+    setMessages([]);
+    setPendingMessages({});
+    pendingMessagesRef.current = {};
+    setInput('');
+  }
+
   if (!isLoggedIn) {
     return (
       <div style={styles.centered}>
@@ -241,7 +285,7 @@ function App() {
           >
             Start Secure Chat
           </button>
-          <button onClick={() => setIsLoggedIn(false)} style={styles.logoutBtn}>Change User</button>
+          <button onClick={() => logout()} style={styles.logoutBtn}>Change User</button>
         </div>
       </div>
     );
@@ -253,11 +297,7 @@ function App() {
         <div style={styles.headerRow}>
           <h4>Talking to: {recipientId}</h4>
           <button 
-            onClick={() => {
-              setChatStarted(false);
-              setMessages([]);
-              setRecipientId('');
-            }} 
+            onClick={() => leaveChat()} 
             style={styles.backBtn}
           >
             Back
@@ -290,12 +330,7 @@ function App() {
           <button onClick={sendMessage} style={styles.sendBtn}>Send</button>
         </div>
         
-        <button onClick={() => {
-              setIsLoggedIn(false)
-              setChatStarted(false);
-              setMessages([]);
-              setRecipientId('');
-            }} style={styles.logoutBtn}>Logout</button>
+        <button onClick={() => logout()} style={styles.logoutBtn}>Logout</button>
       </div>
     </div>
   );
