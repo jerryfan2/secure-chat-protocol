@@ -1,8 +1,11 @@
 import asyncio
 import websockets
-import sqlite3
 import json
-from models.models import MessageType, MessageData
+from models.models import MessageType, MessageData, Base, MessageRecord, UserKey
+from sqlalchemy import create_engine, select, and_, or_, desc, asc
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.sqlite import insert
 
 class ChatServer:
     def __init__(self, domain="localhost", port=8765):
@@ -14,40 +17,11 @@ class ChatServer:
 
     def initialize_db(self):
         self.db_name = 'messaging.db'
-        self.msg_table_name = "messages"
-        self.keys_table_name = "keys"
+        engine = create_engine(f"sqlite:///{self.db_name}")
 
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        self.db_conn = conn
-
-        cursor.execute(f'''
-            CREATE TABLE IF NOT EXISTS {self.msg_table_name} (
-                id INTEGER PRIMARY KEY NOT NULL,
-                sender_id INTEGER NOT NULL,
-                recipient_id INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                sent_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-            );
-            '''
-        )
+        Base.metadata.create_all(engine)
+        self.session = Session(engine)
         
-        cursor.execute(f'''
-            CREATE INDEX IF NOT EXISTS idx_conversation
-                ON {self.msg_table_name} (sender_id, recipient_id, sent_time);
-            '''
-        )
-
-        cursor.execute(f'''
-            CREATE TABLE IF NOT EXISTS {self.keys_table_name} (
-                user_id INTEGER PRIMARY KEY NOT NULL,
-                key_str TEXT NOT NULL,
-                creation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-            );
-            '''
-        )
-
-        conn.commit()
 
     async def serve(self):
         async with websockets.serve(self.receive_loop, self.domain, self.port) as server:
@@ -60,99 +34,16 @@ class ChatServer:
                 data = MessageData.from_json(message)
                 match data.message_type:
                     case MessageType.CONNECTION_SETUP:
-                        self.user_to_websockets[data.sender_id] = websocket
-                        self.websockets_to_user[websocket] = data.sender_id
-
-                        self.db_conn.cursor().execute(f'''
-                                INSERT INTO {self.keys_table_name}
-                                VALUES (?, ?, ?)
-                                ON CONFLICT(user_id) DO UPDATE SET
-                                    key_str = EXCLUDED.key_str,
-                                    creation_time = EXCLUDED.creation_time
-                            ''', (data.sender_id, data.content, data.sent_time.isoformat())
-                        )
-                        self.db_conn.commit()
-                        print(f"Registered sender {data.sender_id}")
+                        self.handle_connection_setup(websocket, data)
 
                     case MessageType.MESSAGE:
-                        print(f"Received: {data}")
-                        time_str = data.sent_time.isoformat()
-                        self.db_conn.cursor().execute(f"""
-                                INSERT INTO {self.msg_table_name}
-                                VALUES (NULL, ?, ?, ?, ?)
-                            """, (data.sender_id, data.recipient_id, data.content, time_str)
-                        )
-                        self.db_conn.commit()
-                        if data.recipient_id in self.user_to_websockets:
-                            await self.user_to_websockets[data.recipient_id].send(data.to_json())
+                        await self.handle_connection_setup(websocket, data)
 
                     case MessageType.KEY_REQUEST:
-                        uid = data.sender_id
-                        peer_id = data.recipient_id
-                        print(f"User {uid} requesting key for user {peer_id}")
-
-                        cursor = self.db_conn.cursor()
-                        cursor.execute(f"""
-                            SELECT user_id, key_str
-                            FROM {self.keys_table_name}
-                            WHERE user_id = ? OR user_id = ? 
-                        """, (uid, peer_id)
-                        )
-                        results = cursor.fetchall()
-                        key_map = {row[0]: row[1] for row in results}
-
-                        if peer_id in key_map:
-                            response = MessageData(
-                                peer_id,
-                                uid,
-                                MessageType.KEY_REQUEST,
-                                key_map[peer_id]
-                            )
-                            await self.user_to_websockets[uid].send(response.to_json())
-                            print(f"User {peer_id} sent public key to user {uid}")
-                        
-                        if uid in key_map and peer_id in self.user_to_websockets:
-                            forward_msg = MessageData(
-                                uid,
-                                peer_id,
-                                MessageType.KEY_REQUEST,
-                                key_map[uid]
-                            )
-                            await self.user_to_websockets[peer_id].send(forward_msg.to_json())
-                            print(f"User {uid} sent public key to user {peer_id}")
+                        await self.handle_key_request(websocket, data)
 
                     case MessageType.HISTORY_REQUEST:
-                        uid = data.sender_id
-                        peer_id = data.recipient_id
-
-                        cursor = self.db_conn.cursor()
-
-                        cursor.execute('''
-                                SELECT * FROM (
-                                    SELECT sender_id, recipient_id, content, sent_time
-                                    FROM messages
-                                    WHERE (sender_id = ? AND recipient_id = ?)
-                                        OR (sender_id =? AND recipient_id = ?)
-                                    ORDER by sent_time DESC
-                                    LIMIT 50  
-                                )
-                                ORDER BY sent_time asc           
-                            ''', (uid, peer_id, peer_id, uid)
-                        )
-
-                        rows = cursor.fetchall()
-                        messages = [{
-                            "sender_id": row[0],
-                            "recipient_id": row[1],
-                            "message_type": MessageType.MESSAGE,
-                            "content": row[2],
-                            "sent_time": row[3]
-                        } for row in rows]
-
-                        msg = MessageData(uid, peer_id, MessageType.HISTORY_REQUEST, json.dumps(messages))
-                        await self.user_to_websockets[uid].send(msg.to_json())
-                        print(f"History of user {uid}, {peer_id} sent to user {uid}")
-
+                        await self.handle_history_request(websocket, data)
 
                     case _:
                         print("Server: Unknown message type")
@@ -164,6 +55,98 @@ class ChatServer:
         finally:
             self.cleanup_connection(websocket)
     
+    def handle_connection_setup(self, websocket, data):
+        self.user_to_websockets[data.sender_id] = websocket
+        self.websockets_to_user[websocket] = data.sender_id
+
+        stmt = insert(UserKey).values(
+            user_id=data.sender_id,
+            public_key=data.content
+        )
+        upsert_stmt = stmt.on_conflict_do_update(
+            index_elements=['user_id'],
+            set_=dict(public_key = data.content)
+        )
+        self.session.execute(upsert_stmt)
+        self.session.commit()
+        print(f"Registered sender {data.sender_id}")
+    
+    async def handle_message(self, websocket, data):
+        print(f"Received: {data}")
+        try:
+            message_record = MessageRecord(
+                sender_id=data.sender_id,
+                recipient_id=data.recipient_id,
+                content=data.content
+            )
+            self.session.add(message_record)
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            print("Duplicate message detected. Skipping")
+        if data.recipient_id in self.user_to_websockets:
+            await self.user_to_websockets[data.recipient_id].send(data.to_json())
+
+    async def handle_key_request(self, websocket, data):
+        uid = data.sender_id
+        peer_id = data.recipient_id
+        print(f"User {uid} requesting key for user {peer_id}")
+
+        stmt = select(UserKey).where(
+            or_(UserKey.user_id == uid, UserKey.user_id == peer_id)
+        )
+
+        results = self.session.execute(stmt).scalars().all()
+        key_map = {row.user_id: row.public_key for row in results}
+
+        if peer_id in key_map:
+            response = MessageData(
+                peer_id,
+                uid,
+                MessageType.KEY_REQUEST,
+                key_map[peer_id]
+            )
+            await self.user_to_websockets[uid].send(response.to_json())
+            print(f"User {peer_id} sent public key to user {uid}")
+        
+        if uid in key_map and peer_id in self.user_to_websockets:
+            forward_msg = MessageData(
+                uid,
+                peer_id,
+                MessageType.KEY_REQUEST,
+                key_map[uid]
+            )
+            await self.user_to_websockets[peer_id].send(forward_msg.to_json())
+            print(f"User {uid} sent public key to user {peer_id}")
+
+    async def handle_history_request(self, websocket, data):
+        uid = data.sender_id
+        peer_id = data.recipient_id
+
+        inner_stmt = select(MessageRecord).where(
+            or_(
+                and_(MessageRecord.sender_id == uid, MessageRecord.recipient_id == peer_id),
+                and_(MessageRecord.sender_id == peer_id, MessageRecord.recipient_id == uid)
+            )
+        ).order_by(desc(MessageRecord.sent_at)).limit(50)
+        subq = inner_stmt.subquery()
+        outer_stmt = (
+            select(subq)
+            .order_by(asc(subq.c.sent_at))
+        )
+        rows = self.session.execute(outer_stmt).all()
+
+        messages = [{
+            "sender_id": row.sender_id,
+            "recipient_id": row.recipient_id,
+            "message_type": MessageType.MESSAGE,
+            "content": row.content,
+        } for row in rows]
+
+        msg = MessageData(uid, peer_id, MessageType.HISTORY_REQUEST, json.dumps(messages))
+        await self.user_to_websockets[uid].send(msg.to_json())
+        print(f"History of user {uid}, {peer_id} sent to user {uid}")
+
 
     def cleanup_connection(self, websocket):
         user_id = self.websockets_to_user.get(websocket)
@@ -180,7 +163,7 @@ async def main():
     server = ChatServer()
     server.initialize_db()
     await server.serve()
-    server.db_conn.close()
+    server.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -3,6 +3,9 @@ from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass
 
+from sqlalchemy import String, func, Index
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
 class MessageType(str, Enum):
     CONNECTION_SETUP = 'CONNECTION_SETUP'
     MESSAGE = 'MESSAGE'
@@ -15,7 +18,6 @@ class MessageData:
     recipient_id: int
     message_type: MessageType
     content: str = ""
-    sent_time: datetime = datetime.now()
 
     def to_json(self):
         return json.dumps({
@@ -23,15 +25,34 @@ class MessageData:
         "recipient_id": self.recipient_id,
         "message_type": self.message_type,
         "content": self.content,
-        "sent_time": self.sent_time.isoformat()
         })
     
     @classmethod
     def from_json(cls, json_str):
         data = json.loads(json_str)
-        if "sent_time" in data and isinstance(data["sent_time"], str):
-            try:
-                data["sent_time"] = datetime.fromisoformat(data["sent_time"])
-            except ValueError:
-                data["sent_time"] = datetime.now()
         return cls(**data)
+
+class Base(DeclarativeBase):
+    pass
+
+class MessageRecord(Base):
+    __tablename__ = 'messages'
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    sender_id: Mapped[int]
+    recipient_id: Mapped[int]
+    content: Mapped[str] = mapped_column(String)
+    sent_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_conversation", "sender_id", "recipient_id", "sent_at"),
+    )
+
+class UserKey(Base):
+    __tablename__ = 'keys'
+
+    # id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(primary_key=True)
+    public_key: Mapped[str] = mapped_column(String)
+    creation_time: Mapped[datetime] = mapped_column(server_default=func.now())
