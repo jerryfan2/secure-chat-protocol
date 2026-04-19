@@ -1,7 +1,6 @@
-import asyncio
 import websockets
 import json
-from models.models import MessageType, MessageData, Base, MessageRecord, UserKey
+from ..models.models import MessageType, MessageData, Base, MessageRecord, UserKey
 from sqlalchemy import create_engine, select, and_, or_, desc, asc
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -15,12 +14,18 @@ class ChatServer:
         self.user_to_websockets = {}
         self.websockets_to_user = {}
 
+        self.initialize_db()
+
     def initialize_db(self):
         self.db_name = 'messaging.db'
         engine = create_engine(f"sqlite:///{self.db_name}")
 
         Base.metadata.create_all(engine)
         self.session = Session(engine)
+
+    def cleanup(self):
+        if self.session:
+            self.session.close()
         
 
     async def serve(self):
@@ -160,13 +165,3 @@ class ChatServer:
             print(f"User {user_id} disconnected and cleaned up.")
         else:
             print("A connection closed before registration.")
-
-
-async def main():
-    server = ChatServer()
-    server.initialize_db()
-    await server.serve()
-    server.session.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
