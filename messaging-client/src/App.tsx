@@ -7,7 +7,6 @@ interface ChatMessage {
   recipient_id: number;
   message_type: string;
   content: string;
-  sent_time: Date
 }
 
 function App() {
@@ -82,8 +81,7 @@ function App() {
           sender_id: parseInt(userId),
           recipient_id: 0,
           message_type: "CONNECTION_SETUP",
-          content: JSON.stringify(publicKeyArray),
-          sent_time: new Date()
+          content: JSON.stringify(publicKeyArray)
         };
         
         socket.current?.send(JSON.stringify(setupMsg));
@@ -206,8 +204,7 @@ function App() {
       sender_id: parseInt(userId),
       recipient_id: parseInt(recipientId),
       message_type: "MESSAGE",
-      content: JSON.stringify(encryptedPackage),
-      sent_time: new Date()
+      content: JSON.stringify(encryptedPackage)
     };
 
     if (socket.current.readyState === WebSocket.OPEN) {
