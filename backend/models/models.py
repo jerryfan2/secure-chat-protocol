@@ -3,7 +3,7 @@ from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass
 
-from sqlalchemy import String, func, Index
+from sqlalchemy import String, Integer, func, Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class MessageType(str, Enum):
@@ -14,6 +14,7 @@ class MessageType(str, Enum):
 
 @dataclass
 class MessageData:
+    client_msg_id: str
     sender_id: int
     recipient_id: int
     message_type: MessageType
@@ -21,6 +22,7 @@ class MessageData:
 
     def to_json(self):
         return json.dumps({
+        "client_msg_id": self.client_msg_id,
         "sender_id": self.sender_id,
         "recipient_id": self.recipient_id,
         "message_type": self.message_type,
@@ -38,12 +40,13 @@ class Base(DeclarativeBase):
 class MessageRecord(Base):
     __tablename__ = 'messages'
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_msg_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
 
-    sender_id: Mapped[int]
-    recipient_id: Mapped[int]
-    content: Mapped[str] = mapped_column(String)
-    sent_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    sender_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    recipient_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(String, nullable=False)
+    sent_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
 
     __table_args__ = (
         Index("idx_conversation", "sender_id", "recipient_id", "sent_at"),

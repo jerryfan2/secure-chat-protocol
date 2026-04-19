@@ -9,6 +9,7 @@ type MessageType =
   | "HISTORY_REQUEST";
 
 interface ChatMessage {
+  client_msg_id: string;
   sender_id: number;
   recipient_id: number;
   message_type: MessageType;
@@ -19,6 +20,7 @@ function App() {
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
   const [chatStarted, setChatStarted] = useState<boolean>(false);
   const [userId, setUserId] = useState<string>('');
+
   const [recipientId, setRecipientId] = useState<string>('');
   const recipientIdRef = useRef<string>('');
 
@@ -84,6 +86,7 @@ function App() {
         const publicKeyArray = await exportPublicKey(keys.publicKey);
 
         const setupMsg: ChatMessage = {
+          client_msg_id: "",
           sender_id: parseInt(userId),
           recipient_id: 0,
           message_type: "CONNECTION_SETUP",
@@ -132,20 +135,24 @@ function App() {
       } else {
         console.log(`New recipient detected: ${targetId}. Requesting key...`);
         
-        socket.current.send(JSON.stringify({
+        const key_request_msg: ChatMessage = {
+          client_msg_id: "",
           message_type: "KEY_REQUEST",
           sender_id: uid,
           recipient_id: targetId,
           content: ""
-        }));
+        }
+        socket.current.send(JSON.stringify(key_request_msg));
       }
 
-      socket.current.send(JSON.stringify({
+      const history_request_msg: ChatMessage = {
+        client_msg_id: "",
         message_type: "HISTORY_REQUEST",
         sender_id: uid,
         recipient_id: targetId,
         content: ""
-      }))
+      }
+      socket.current.send(JSON.stringify(history_request_msg))
     }
   }, [chatStarted]);
 
@@ -224,6 +231,7 @@ function App() {
     const encryptedPackage = await encryptData(input, sharedSecret);
 
     const msg: ChatMessage = {
+      client_msg_id: crypto.randomUUID(),
       sender_id: parseInt(userId),
       recipient_id: parseInt(recipientId),
       message_type: "MESSAGE",

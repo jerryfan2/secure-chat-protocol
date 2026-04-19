@@ -75,6 +75,7 @@ class ChatServer:
         print(f"Received: {data}")
         try:
             message_record = MessageRecord(
+                client_msg_id=data.client_msg_id,
                 sender_id=data.sender_id,
                 recipient_id=data.recipient_id,
                 content=data.content
@@ -101,6 +102,7 @@ class ChatServer:
 
         if peer_id in key_map:
             response = MessageData(
+                "",
                 peer_id,
                 uid,
                 MessageType.KEY_REQUEST,
@@ -111,6 +113,7 @@ class ChatServer:
         
         if uid in key_map and peer_id in self.user_to_websockets:
             forward_msg = MessageData(
+                "",
                 uid,
                 peer_id,
                 MessageType.KEY_REQUEST,
@@ -143,7 +146,7 @@ class ChatServer:
             "content": row.content,
         } for row in rows]
 
-        msg = MessageData(uid, peer_id, MessageType.HISTORY_REQUEST, json.dumps(messages))
+        msg = MessageData("", uid, peer_id, MessageType.HISTORY_REQUEST, json.dumps(messages))
         await self.user_to_websockets[uid].send(msg.to_json())
         print(f"History of user {uid}, {peer_id} sent to user {uid}")
 
