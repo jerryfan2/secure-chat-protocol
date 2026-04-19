@@ -1,5 +1,5 @@
-backend/*.db
-backend/.venv/
+*.db
+**/.venv/
 **/__pycache__/
 *.pyc
 *.pyo
