@@ -37,7 +37,7 @@ class ChatServer:
                         self.handle_connection_setup(websocket, data)
 
                     case MessageType.MESSAGE:
-                        await self.handle_connection_setup(websocket, data)
+                        await self.handle_message(websocket, data)
 
                     case MessageType.KEY_REQUEST:
                         await self.handle_key_request(websocket, data)

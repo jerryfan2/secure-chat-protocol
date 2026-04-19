@@ -2,10 +2,16 @@ import { useState, useRef, useEffect } from 'react'
 import './App.css'
 import { getPersistentKeyPair, deriveSharedSecret, exportPublicKey, encryptData, decryptData } from './utils/crypto';
 
+type MessageType = 
+  | "CONNECTION_SETUP" 
+  | "KEY_REQUEST" 
+  | "MESSAGE" 
+  | "HISTORY_REQUEST";
+
 interface ChatMessage {
   sender_id: number;
   recipient_id: number;
-  message_type: string;
+  message_type: MessageType;
   content: string;
 }
 
@@ -90,67 +96,18 @@ function App() {
 
     socket.current.onmessage = async (event: MessageEvent) => {
       const data = JSON.parse(event.data) as ChatMessage;
-      if (data.message_type === "KEY_REQUEST") {
-        const currentKeys = myKeysRef.current;
-
-        if (currentKeys?.privateKey) {
-          const theirId = data.sender_id;
-          const theirPublicKeyRaw = JSON.parse(data.content)
-          const bufferSource = new Uint8Array(theirPublicKeyRaw);
-          const derivedSecret = await deriveSharedSecret(currentKeys.privateKey, bufferSource.buffer);
-          console.log(`Setting shared key of user ${theirId} for user ${data.recipient_id}!`)
-          
-          secretRingRef.current[theirId] = derivedSecret;
-          setSecretRing(prev => ({
-            ...prev,
-            [theirId]: derivedSecret
-          }))
-
-          const messagesToProcess = pendingMessagesRef.current[theirId] || []
-          if (messagesToProcess.length > 0) {
-            console.log(`Processing ${messagesToProcess.length} pending messages for conversation with user ${theirId}`);
-            processReceivedBatch(messagesToProcess, derivedSecret);
-          }
-
-          setPendingMessages(prevPending => {
-            const nextPending = { ...prevPending };
-            delete nextPending[theirId];
-            return nextPending;
-          })
-        }
-      } else if (data.message_type === "MESSAGE") {
-        const senderId = data.sender_id;
-        
-        const sharedSecret = secretRingRef.current[senderId];
-        if (!sharedSecret) {
-          console.log(`No secret for user ${senderId}, requesting key...`);
-          setPendingMessages(prev => ({
-            ...prev,
-            [senderId]: [...(prev[senderId] || []), data]
-          }))
-        }
-        else {
-          try {
-            await processReceivedMsg(data, sharedSecret);
-          } catch (e) {
-            console.error("Failed to process message:", e);
-          }
-        }
-      } else if (data.message_type == "HISTORY_REQUEST") {
-        const historyArray = JSON.parse(data.content) as ChatMessage[];
-        const peerId = data.recipient_id
-        const sharedSecret = secretRingRef.current[peerId]
-        console.log(`User ${data.sender_id} received chat history with user ${peerId}. History length: ${historyArray.length}`)
-        if (!sharedSecret) {
-          console.log("Shared secret not availble yet, putting into pending messages for now")
-          setPendingMessages(prev => ({
-            ...prev,
-            [peerId]: [...historyArray, ...(prev[peerId] || [])]
-          }))
-        } else {
-          console.log(`Shared secret detected for user ${data.sender_id} and ${peerId}! Processing`)
-          processReceivedBatch(historyArray, sharedSecret);
-        }
+      switch (data.message_type) {
+        case "KEY_REQUEST":
+          await handle_receive_key(data);
+          break;
+        case "MESSAGE":
+          await handle_receive_message(data);
+          break;
+        case "HISTORY_REQUEST":
+          await handle_receive_history_request(data);
+          break;
+        default:
+          console.warn("Unknown message type received:", data.message_type);
       }
     };
 
@@ -168,7 +125,7 @@ function App() {
       console.log("Recipient number:", recipientId)
       const uid = parseInt(userId);
       const targetId = parseInt(recipientId);
-      const sharedSecret = secretRingRef.current[targetId];
+      const sharedSecret = secretRing[targetId];
 
       if (sharedSecret) {
         console.log(`Secret for ${targetId} already exists. Ready to chat.`);
@@ -191,6 +148,72 @@ function App() {
       }))
     }
   }, [chatStarted]);
+
+  async function handle_receive_key(data: ChatMessage) {
+    const currentKeys = myKeysRef.current;
+    if (!currentKeys?.privateKey) return;
+
+    const theirId = data.sender_id;
+    const theirPublicKeyRaw = JSON.parse(data.content)
+    const bufferSource = new Uint8Array(theirPublicKeyRaw);
+    const derivedSecret = await deriveSharedSecret(currentKeys.privateKey, bufferSource.buffer);
+    console.log(`Setting shared key of user ${theirId} for user ${data.recipient_id}!`)
+    
+    secretRingRef.current[theirId] = derivedSecret;
+    setSecretRing(prev => ({
+      ...prev,
+      [theirId]: derivedSecret
+    }))
+
+    const messagesToProcess = pendingMessagesRef.current[theirId] || []
+    if (messagesToProcess.length > 0) {
+      console.log(`Processing ${messagesToProcess.length} pending messages for conversation with user ${theirId}`);
+      processReceivedBatch(messagesToProcess, derivedSecret);
+    }
+
+    setPendingMessages(prevPending => {
+      const nextPending = { ...prevPending };
+      delete nextPending[theirId];
+      return nextPending;
+    })
+  }
+
+  async function handle_receive_message(data: ChatMessage) {
+    const senderId = data.sender_id;
+    
+    const sharedSecret = secretRingRef.current[senderId];
+    if (!sharedSecret) {
+      console.log(`No secret for user ${senderId}, requesting key...`);
+      setPendingMessages(prev => ({
+        ...prev,
+        [senderId]: [...(prev[senderId] || []), data]
+      }))
+    }
+    else {
+      try {
+        await processReceivedMsg(data, sharedSecret);
+      } catch (e) {
+        console.error("Failed to process message:", e);
+      }
+    }
+  }
+
+  async function handle_receive_history_request(data: ChatMessage) {
+    const historyArray = JSON.parse(data.content) as ChatMessage[];
+    const peerId = data.recipient_id
+    const sharedSecret = secretRingRef.current[peerId]
+    console.log(`User ${data.sender_id} received chat history with user ${peerId}. History length: ${historyArray.length}`)
+    if (!sharedSecret) {
+      console.log("Shared secret not availble yet, putting into pending messages for now")
+      setPendingMessages(prev => ({
+        ...prev,
+        [peerId]: [...historyArray, ...(prev[peerId] || [])]
+      }))
+    } else {
+      console.log(`Shared secret detected for user ${data.sender_id} and ${peerId}! Processing`)
+      processReceivedBatch(historyArray, sharedSecret);
+    }
+  }
 
   const sendMessage = async () => {
     const sharedSecret = secretRing[parseInt(recipientId)]
@@ -222,14 +245,10 @@ function App() {
     setChatStarted(false);
     setUserId('');
     setRecipientId('');
-    recipientIdRef.current = '';
     setMyKeys(null);
-    myKeysRef.current = null;
     setSecretRing({});
-    secretRingRef.current = {};
     setMessages([]);
     setPendingMessages({});
-    pendingMessagesRef.current = {};
     setInput('');
     socket.current?.close();
     socket.current = null;
@@ -238,10 +257,8 @@ function App() {
   function leaveChat() {
     setChatStarted(false);
     setRecipientId('');
-    recipientIdRef.current = '';
     setMessages([]);
     setPendingMessages({});
-    pendingMessagesRef.current = {};
     setInput('');
   }
 
