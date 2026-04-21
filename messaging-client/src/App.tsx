@@ -1,250 +1,235 @@
 import { useState, useRef, useEffect } from 'react'
 import './App.css'
-import { getPersistentKeyPair, deriveSharedSecret, exportPublicKey, encryptData, decryptData } from './utils/crypto';
-
-type MessageType = 
-  | "CONNECTION_SETUP" 
-  | "KEY_REQUEST" 
-  | "MESSAGE" 
-  | "HISTORY_REQUEST";
-
-interface ChatMessage {
-  client_msg_id: string;
-  sender_id: number;
-  recipient_id: number;
-  message_type: MessageType;
-  content: string;
-}
+import { getPersistentKeyPair, deriveSharedSecret, encryptData, decryptData } from './utils/crypto';
+import { type MessageRecord, type UserKeyRecord } from './models/models';
+import { httpService} from './api/httpService';
+import { socketService } from './api/socketService';
+import { type WSMessage } from './types/socketService.types';
+import { mapHttpMessageResponse, mapWSMessageResponse } from './api/mappers';
 
 function App() {
+
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
   const [chatStarted, setChatStarted] = useState<boolean>(false);
+
   const [userId, setUserId] = useState<string>('');
+  const userIdRef = useRef<string>('');
 
   const [recipientId, setRecipientId] = useState<string>('');
   const recipientIdRef = useRef<string>('');
 
-  const [myKeys, setMyKeys] = useState<CryptoKeyPair | null>(null);
-  const myKeysRef = useRef<CryptoKeyPair | null>(null);
+  const activeKeyIdRef = useRef<number | null>(null);
+  const myKeysRef = useRef<Map<number, CryptoKeyPair>>(new Map());
+  const peerPublicKeyIdsRef = useRef<Map<number, number>>(new Map());
+  // shared keys used combined, sorted keys
+  const sharedKeysSecretRingRef = useRef<Map<string, CryptoKey>>(new Map());
 
-  const [secretRing, setSecretRing] = useState<Record<number, CryptoKey>>({})
-  const secretRingRef = useRef<Record<number, CryptoKey>>({});
-
-  const [pendingMessages, setPendingMessages] = useState<Record<number, ChatMessage[]>>({});
-  const pendingMessagesRef = useRef<Record<number, ChatMessage[]>>({});
-
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [input, setInput] = useState<string>('');
+  
+  function getSharedCacheKey(idA: number, idB: number): string {
+    const [first, second] = [idA, idB].sort((a, b) => a - b);
+    return `${first}:${second}`;
+  }
 
-  const socket = useRef<WebSocket | null>(null);
+  const processReceivedMsg = async (message: MessageRecord) => {
+    const senderId = message.senderId;
+    const recipientId = message.recipientId;
+    if (!((message.senderId === senderId && message.recipientId === recipientId) ||
+        (message.recipientId === recipientId && message.senderId === senderId)))
+      return;
 
-  const processReceivedMsg = async (message: ChatMessage, secret: CryptoKey) => {
+    const senderKeyId = message.senderKeyId
+    const recipientKeyId = message.recipientKeyId;
+    const sharedCacheKey = getSharedCacheKey(senderKeyId, recipientKeyId);
+
+    let sharedSecret = sharedKeysSecretRingRef.current.get(sharedCacheKey);
+    if (!sharedSecret) {
+      if (senderKeyId != activeKeyIdRef.current || 
+        recipientKeyId != activeKeyIdRef.current) return;
+
+      const fetchedKey = senderKeyId == activeKeyIdRef.current ? 
+        await fetchPublicKeyById(recipientKeyId) :
+        await fetchPublicKeyById(senderKeyId);
+      const sharedKey = await calculateSharedFromRawPublicKey(fetchedKey);
+      if (sharedKey) {
+        sharedSecret = sharedKey;
+        sharedKeysSecretRingRef.current.set(sharedCacheKey, sharedKey);
+      }
+    }
+    if (!sharedSecret) return;
     const { ciphertext, iv } = JSON.parse(message.content);
-    const decryptedText = await decryptData(ciphertext, iv, secret);
-    const decryptedMsg = {...message, content: decryptedText};
+    const decryptedText = await decryptData(ciphertext, iv, sharedSecret);
     
-    const currentPeer = parseInt(recipientIdRef.current);
-    if (message.sender_id === currentPeer || (message.recipient_id === currentPeer && message.sender_id === parseInt(userId))) {
-      setMessages((prev) => [...prev, decryptedMsg]);
+    const msgRecord: MessageRecord = {
+      ...message,
+      content: decryptedText
     }
-  }
+    setMessages((prev) => [...prev, msgRecord]);
+  };
 
-  const processReceivedBatch = (waitingMessages: ChatMessage[], secret: CryptoKey) => {
+  const processReceivedBatch = async (waitingMessages: MessageRecord[]) => {
     for (const msg of waitingMessages) {
-      processReceivedMsg(msg, secret);
+      await processReceivedMsg(msg);
     }
-  }
-
-  useEffect(() => {
-    myKeysRef.current = myKeys;
-  }, [myKeys]);
-
-  useEffect(() => {
-    secretRingRef.current = secretRing;
-  }, [secretRing]);
-
-  useEffect(() => {
-    pendingMessagesRef.current = pendingMessages
-  }, [pendingMessages])
+  };
 
   useEffect(() => {
     recipientIdRef.current = recipientId;
   }, [recipientId]);
 
   useEffect(() => {
+    userIdRef.current = userId;
+  }, [userId]);
+
+  useEffect(() => {
     if (!isLoggedIn) return;
     console.log(`Log-in detected. Origin: ${window.location.origin}, User: ${userId}`);
-    socket.current = new WebSocket('ws://localhost:8765');
 
-    socket.current.onopen = async () => {
-      console.log(`Connected as User ${userId}`);
-      
-      const keys = await getPersistentKeyPair(userId);
-      setMyKeys(keys);
-
-      if (keys && keys.publicKey) {
-        const publicKeyArray = await exportPublicKey(keys.publicKey);
-
-        const setupMsg: ChatMessage = {
-          client_msg_id: "",
-          sender_id: parseInt(userId),
-          recipient_id: 0,
-          message_type: "CONNECTION_SETUP",
-          content: JSON.stringify(publicKeyArray)
-        };
-        
-        socket.current?.send(JSON.stringify(setupMsg));
-      }
-    };
-
-    socket.current.onmessage = async (event: MessageEvent) => {
-      const data = JSON.parse(event.data) as ChatMessage;
-      switch (data.message_type) {
-        case "KEY_REQUEST":
-          await handle_receive_key(data);
-          break;
+    const initializeSecurity = async () => {
+      const keys: UserKeyRecord = await getPersistentKeyPair(parseInt(userIdRef.current));
+      activeKeyIdRef.current = keys.id;
+      myKeysRef.current.set(keys.id, keys.keyPair);
+      console.log(`User ${userId} set active key: ${keys.id}`);
+    }
+    initializeSecurity();
+    socketService.connect(parseInt(userIdRef.current), async (msg: WSMessage ) => {
+      switch (msg.message_type) {
         case "MESSAGE":
-          await handle_receive_message(data);
+          await handleReceiveMessage(msg);
           break;
-        case "HISTORY_REQUEST":
-          await handle_receive_history_request(data);
+        case "RECEIPT":
+          break
+        case "RECEIPT_ERROR":
+          await handleReceiveReceiptError(msg);
           break;
         default:
-          console.warn("Unknown message type received:", data.message_type);
+          console.warn("Unknown message type received:", msg.message_type);
       }
-    };
-
-    socket.current.onclose = () => console.log("Socket closed");
-    socket.current.onerror = (error) => console.error("WebSocket Error:", error);
+    });
+    console.log(`Connected as User ${userId}`);
 
     return () => {
-      socket.current?.close();
+      socketService.disconnect();
     };
   }, [isLoggedIn]);
 
   useEffect(() => {
     if (!chatStarted) return;
-    if (socket.current?.readyState === WebSocket.OPEN && isLoggedIn && recipientId && myKeys) {
-      console.log("Recipient number:", recipientId)
-      const uid = parseInt(userId);
-      const targetId = parseInt(recipientId);
-      const sharedSecret = secretRing[targetId];
+    if (!(isLoggedIn && recipientId && activeKeyIdRef.current)) return;
+    console.log("Recipient number:", recipientId)
+    const uid = parseInt(userId);
+    const targetId = parseInt(recipientId);
 
-      if (sharedSecret) {
-        console.log(`Secret for ${targetId} already exists. Ready to chat.`);
-      } else {
-        console.log(`New recipient detected: ${targetId}. Requesting key...`);
-        
-        const key_request_msg: ChatMessage = {
-          client_msg_id: "",
-          message_type: "KEY_REQUEST",
-          sender_id: uid,
-          recipient_id: targetId,
-          content: ""
-        }
-        socket.current.send(JSON.stringify(key_request_msg));
+    (async () => {
+      const receivedPeerKey = await fetchAndSetPeerKeys(targetId);
+      if (!receivedPeerKey) {
+        setChatStarted(false);
+        return;
       }
-
-      const history_request_msg: ChatMessage = {
-        client_msg_id: "",
-        message_type: "HISTORY_REQUEST",
-        sender_id: uid,
-        recipient_id: targetId,
-        content: ""
-      }
-      socket.current.send(JSON.stringify(history_request_msg))
-    }
+      await fetchAndSetMessageHistory(uid, targetId);
+    })();
   }, [chatStarted]);
 
-  async function handle_receive_key(data: ChatMessage) {
-    const currentKeys = myKeysRef.current;
-    if (!currentKeys?.privateKey) return;
-
-    const theirId = data.sender_id;
-    const theirPublicKeyRaw = JSON.parse(data.content)
-    const bufferSource = new Uint8Array(theirPublicKeyRaw);
-    const derivedSecret = await deriveSharedSecret(currentKeys.privateKey, bufferSource.buffer);
-    console.log(`Setting shared key of user ${theirId} for user ${data.recipient_id}!`)
-    
-    secretRingRef.current[theirId] = derivedSecret;
-    setSecretRing(prev => ({
-      ...prev,
-      [theirId]: derivedSecret
-    }))
-
-    const messagesToProcess = pendingMessagesRef.current[theirId] || []
-    if (messagesToProcess.length > 0) {
-      console.log(`Processing ${messagesToProcess.length} pending messages for conversation with user ${theirId}`);
-      processReceivedBatch(messagesToProcess, derivedSecret);
-    }
-
-    setPendingMessages(prevPending => {
-      const nextPending = { ...prevPending };
-      delete nextPending[theirId];
-      return nextPending;
-    })
+  async function fetchAndSetMessageHistory(userA: number, userB: number) {
+    const msgHistoryResponse = await httpService.fetchMessageHistory(userA, userB);
+    const msgHistory = msgHistoryResponse.map((msg) => mapHttpMessageResponse(msg)).filter(msg => msg != null);
+    processReceivedBatch(msgHistory);
+    console.log(`User ${userA} received conversation with user ${userB}`);
   }
 
-  async function handle_receive_message(data: ChatMessage) {
-    const senderId = data.sender_id;
-    
-    const sharedSecret = secretRingRef.current[senderId];
-    if (!sharedSecret) {
-      console.log(`No secret for user ${senderId}, requesting key...`);
-      setPendingMessages(prev => ({
-        ...prev,
-        [senderId]: [...(prev[senderId] || []), data]
-      }))
+  async function fetchAndSetPeerKeys(peerId: number): Promise<boolean> {
+    const activeKeyId = activeKeyIdRef.current;
+    if (!activeKeyId) return false;
+
+    const targetPublicKeyResponse = await httpService.fetchActivePublicKey(peerId);
+    if (targetPublicKeyResponse) {
+      const targetKeyId = targetPublicKeyResponse.id;
+      const secretRingCacheKey = getSharedCacheKey(activeKeyId, targetKeyId);
+
+      peerPublicKeyIdsRef.current.set(peerId, targetKeyId);
+      const targetPublicKeyRaw: number[] = JSON.parse(targetPublicKeyResponse.public_key);
+      const sharedKey = await calculateSharedFromRawPublicKey(targetPublicKeyRaw);
+      if (sharedKey) {
+        console.log(`Setting shared key of user ${peerId} for user ${userId}!`)
+        sharedKeysSecretRingRef.current.set(secretRingCacheKey, sharedKey);
+        return true;
+      }
     }
-    else {
-      try {
-        await processReceivedMsg(data, sharedSecret);
-      } catch (e) {
-        console.error("Failed to process message:", e);
+    return false;
+  }
+
+  async function fetchPublicKeyById(keyId: number) {
+    const response = await httpService.fetchPublicKeyById(keyId);
+    if (!response) return null;
+    return JSON.parse(response.public_key);
+  }
+
+  async function calculateSharedFromRawPublicKey(publicKeyRaw: number[]) {
+    const bufferSource = new Uint8Array(publicKeyRaw);
+    if (!activeKeyIdRef.current) return null;
+    const activeKey = myKeysRef.current.get(activeKeyIdRef.current);
+    if (!activeKey) return null;
+    return await deriveSharedSecret(activeKey.privateKey, bufferSource.buffer);
+  }
+
+  async function handleReceiveReceiptError(data: WSMessage) {
+    if (data.message_type != "RECEIPT_ERROR") return;
+    const msgId = data.client_msg_id;
+    if (data.payload.sender_key_mismatch) {
+      console.log(`Message ${msgId} sent with expired private key`);
+      // Log out user, possibly try to get new key
+    } else if (data.payload.recipient_key_mismatch) {
+      fetchAndSetPeerKeys(data.recipient_id);
+      const plainMsg = messages.find(m => m.clientMsgId == data.client_msg_id);
+      if (plainMsg) {
+        encryptSendMessage(data.recipient_id, plainMsg.content);
       }
     }
   }
 
-  async function handle_receive_history_request(data: ChatMessage) {
-    const historyArray = JSON.parse(data.content) as ChatMessage[];
-    const peerId = data.recipient_id
-    const sharedSecret = secretRingRef.current[peerId]
-    console.log(`User ${data.sender_id} received chat history with user ${peerId}. History length: ${historyArray.length}`)
-    if (!sharedSecret) {
-      console.log("Shared secret not availble yet, putting into pending messages for now")
-      setPendingMessages(prev => ({
-        ...prev,
-        [peerId]: [...historyArray, ...(prev[peerId] || [])]
-      }))
-    } else {
-      console.log(`Shared secret detected for user ${data.sender_id} and ${peerId}! Processing`)
-      processReceivedBatch(historyArray, sharedSecret);
-    }
+  async function handleReceiveMessage(data: WSMessage) {
+    console.log(`User ${userId} received message from ${data.sender_id}`)
+    if (data.message_type != "MESSAGE") return;
+    const messageRecord = mapWSMessageResponse(data)
+    if (!messageRecord) return;
+    await processReceivedMsg(messageRecord);
   }
 
-  const sendMessage = async () => {
-    const sharedSecret = secretRing[parseInt(recipientId)]
-    if (!input || !socket.current || !sharedSecret) {
+  async function encryptSendMessage(recipientId: number, text: string) {
+    if (!text) return;
+    const userActiveKeyId = activeKeyIdRef.current;
+    if (!userActiveKeyId) return;
+    const uid = parseInt(userId);
+    const peerKeyId = peerPublicKeyIdsRef.current.get(recipientId);
+    if (!peerKeyId) return;
+    const sharedCacheKey = getSharedCacheKey(userActiveKeyId, peerKeyId);
+
+    const sharedSecret = sharedKeysSecretRingRef.current.get(sharedCacheKey);
+
+    if (!sharedSecret) {
       alert("Encryption secret not established yet!");
       return;
     }
-    const encryptedPackage = await encryptData(input, sharedSecret);
+    const encryptedPackage = await encryptData(text, sharedSecret);
 
-    const msg: ChatMessage = {
-      client_msg_id: crypto.randomUUID(),
-      sender_id: parseInt(userId),
-      recipient_id: parseInt(recipientId),
-      message_type: "MESSAGE",
-      content: JSON.stringify(encryptedPackage)
-    };
+    return socketService.sendMessage(uid, recipientId, userActiveKeyId, peerKeyId,
+      JSON.stringify(encryptedPackage));
+  }
 
-    if (socket.current.readyState === WebSocket.OPEN) {
-      socket.current.send(JSON.stringify(msg));
-      
-      const localDisplayMsg = { ...msg, content: input};
-      setMessages((prev) => [...prev, localDisplayMsg]);
-      setInput('');
+  const sendMessage = async () => {
+    const peerId = parseInt(recipientId);
+    const msg = await encryptSendMessage(peerId, input);
+    if (!msg) return;
+    const msgRecord = mapWSMessageResponse(msg);
+    if (!msgRecord) return;
+    const msgPlainRecord: MessageRecord = {
+      ...msgRecord,
+      content: input
     }
+      
+    setMessages((prev) => [...prev, msgPlainRecord]);
+    setInput('');
   };
 
   
@@ -253,20 +238,14 @@ function App() {
     setChatStarted(false);
     setUserId('');
     setRecipientId('');
-    setMyKeys(null);
-    setSecretRing({});
     setMessages([]);
-    setPendingMessages({});
     setInput('');
-    socket.current?.close();
-    socket.current = null;
   }
 
   function leaveChat() {
     setChatStarted(false);
     setRecipientId('');
     setMessages([]);
-    setPendingMessages({});
     setInput('');
   }
 
@@ -332,9 +311,9 @@ function App() {
               key={i} 
               style={{
                 ...styles.msgBase,
-                alignSelf: m.sender_id === parseInt(userId) ? 'flex-end' : 'flex-start',
-                backgroundColor: m.sender_id === parseInt(userId) ? '#007bff' : '#e9e9eb',
-                color: m.sender_id === parseInt(userId) ? 'white' : 'black',
+                alignSelf: m.senderId === parseInt(userId) ? 'flex-end' : 'flex-start',
+                backgroundColor: m.senderId === parseInt(userId) ? '#007bff' : '#e9e9eb',
+                color: m.senderId === parseInt(userId) ? 'white' : 'black',
               }}
             >
               {m.content}

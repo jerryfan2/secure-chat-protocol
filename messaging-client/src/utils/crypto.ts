@@ -1,17 +1,21 @@
 import { openDB } from 'idb';
+import { type UserKeyRecord } from '../models/models';
+import { httpService } from '../api/httpService';
 
 const DB_NAME = 'UserKeyStore';
 const STORE_NAME = 'keys';
 
-export async function getPersistentKeyPair(userId: string): Promise<CryptoKeyPair> {
+export async function getPersistentKeyPair(userId: number): Promise<UserKeyRecord> {
   const db = await openDB(DB_NAME, 1, {
     upgrade(db) {
-      db.createObjectStore(STORE_NAME);
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        store.createIndex('user_active', ['userId', 'isActive']);
+      }
     },
   });
 
-  const userStoreKey = `user-auth-key-${userId}`;
-  const savedKeys = await db.get(STORE_NAME, userStoreKey);
+  const savedKeys = await getActiveKey(db, userId);
   if (savedKeys) return savedKeys;
 
   const keyPair = await window.crypto.subtle.generateKey(
@@ -19,9 +23,22 @@ export async function getPersistentKeyPair(userId: string): Promise<CryptoKeyPai
     false,
     ["deriveKey"]
   );
-
-  await db.put(STORE_NAME, keyPair, userStoreKey);
-  return keyPair;
+  const publicKey = await exportPublicKey(keyPair.publicKey);
+  try {
+    const serverData = await httpService.uploadKey(userId, publicKey);
+    const dataToSave: UserKeyRecord = {
+      id: serverData.id,
+      userId: userId,
+      keyPair: keyPair,
+      isActive: serverData.is_active ? 1 : 0,
+      createdAt: new Date(serverData.creation_time)
+    };
+    await db.put(STORE_NAME, dataToSave);
+    return dataToSave;
+  } catch (error) {
+    console.error("Failed to register key with server", error);
+    throw error;
+  }
 }
 
 export async function deriveSharedSecret(myPrivateKey: CryptoKey, theirPublicKeyRaw: ArrayBuffer) {
@@ -81,4 +98,9 @@ export async function decryptData(ciphertext: number[], iv: number[], key: Crypt
   );
 
   return decoder.decode(decrypted);
+}
+
+async function getActiveKey(db: any, userId: number): Promise<UserKeyRecord | null> {
+  const record = await db.getFromIndex(STORE_NAME, 'user_active', [userId, 1]);
+  return record || null;
 }
