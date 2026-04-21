@@ -60,6 +60,7 @@ function App() {
     if (!sharedSecret) return;
     const { ciphertext, iv } = JSON.parse(message.content);
     const decryptedText = await decryptData(ciphertext, iv, sharedSecret);
+    console.log(decryptedText);
     
     const msgRecord: MessageRecord = {
       ...message,
@@ -125,6 +126,7 @@ function App() {
       const receivedPeerKey = await fetchAndSetPeerKeys(targetId);
       if (!receivedPeerKey) {
         setChatStarted(false);
+        alert("Encryption secret not established yet!");
         return;
       }
       await fetchAndSetMessageHistory(uid, targetId);
@@ -178,7 +180,7 @@ function App() {
     const msgId = data.client_msg_id;
     if (data.payload.sender_key_mismatch) {
       console.log(`Message ${msgId} sent with expired private key`);
-      // Log out user, possibly try to get new key
+      // Log out user, possibly try to get new key, possibly invalidate current key
     } else if (data.payload.recipient_key_mismatch) {
       fetchAndSetPeerKeys(data.recipient_id);
       const plainMsg = messages.find(m => m.clientMsgId == data.client_msg_id);
@@ -208,7 +210,7 @@ function App() {
     const sharedSecret = sharedKeysSecretRingRef.current.get(sharedCacheKey);
 
     if (!sharedSecret) {
-      alert("Encryption secret not established yet!");
+      alert("Shared secret not obtained yet");
       return;
     }
     const encryptedPackage = await encryptData(text, sharedSecret);
